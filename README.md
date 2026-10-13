@@ -22,6 +22,7 @@ Sin argumentos se abre la interfaz; también puedes usar `--gui`. El selector de
 .venv\Scripts\python songsterr_a_invasion.py cancion.mid
 .venv\Scripts\python songsterr_a_invasion.py cancion.mid --list-tracks
 .venv\Scripts\python songsterr_a_invasion.py cancion.mid --track 2 --channel 10
+.venv\Scripts\python songsterr_a_invasion.py cancion.mid --merge-drums --copy-timing --fl-tempo-score
 .venv\Scripts\python songsterr_a_invasion.py cancion.mid --format-zero --copy-timing --include-unmapped
 .venv\Scripts\python songsterr_a_invasion.py cancion.mid --mapping mi_mapa.json --no-alternate-kicks --output salida.mid
 ```
@@ -29,12 +30,14 @@ Sin argumentos se abre la interfaz; también puedes usar `--gui`. El selector de
 | Opción | Efecto |
 | --- | --- |
 | `--track INDICE` | Elegir la pista, con índices desde cero. |
+| `--merge-drums` | Combinar todas las pistas de batería detectadas; excluye `--track`. |
 | `--output PATH` | Elegir el archivo de salida. |
 | `--mapping PATH` | Usar un mapa JSON editable; se crea el predeterminado si falta. |
 | `--no-alternate-kicks` | Desactivar la alternancia de bombos. |
 | `--channel {1,10}` | Canal de batería de salida, 1 por defecto. |
 | `--format-zero` | Todo en una pista MIDI de formato 0. |
 | `--copy-timing` | Copiar tempo y compás también en la pista de batería del formato 1. |
+| `--fl-tempo-score` | Crear un score `.fsc` de tempo y una tabla CSV; opción experimental pendiente de comprobar dentro de FL Studio. |
 | `--include-unmapped` | Guardar las notas sin mapa en `NO_MAPEADAS`; en formato 0 se integran en la única pista. |
 | `--fixed-duration TICKS` | Duración fija positiva en ticks; desactivada por defecto. |
 | `--adk` | Permitir destino MIDI 22 en un mapa personalizado. |
@@ -42,7 +45,7 @@ Sin argumentos se abre la interfaz; también puedes usar `--gui`. El selector de
 | `--list-tracks` | Mostrar las pistas y candidatas sin convertir. |
 | `--gui` | Abrir la interfaz. |
 
-Por defecto produce `cancion_Invasion.mid` y `cancion_reporte.txt` junto al original, y emplea `mapping_invasion.json`. En formato 1, pista 0 contiene el conductor y pista 1 la batería. Si hay varias candidatas, la GUI permite elegir; la CLI muestra los índices y solicita una elección, o exige `--track` cuando se ejecuta sin entrada interactiva. Una pista mixta con notas en canal 10 se filtra por ese canal para evitar convertir instrumentos melódicos. Una pista de batería identificada por su nombre y sin canal 10 usa sus notas de todos los canales. El reporte explica la selección y las notas excluidas.
+Por defecto produce `cancion_Invasion.mid` y `cancion_reporte.txt` junto al original, y emplea `mapping_invasion.json`. En formato 1, pista 0 contiene el conductor y pista 1 la batería. Si hay varias candidatas, la GUI permite elegir; la CLI muestra los índices y solicita una elección, o exige `--track` cuando se ejecuta sin entrada interactiva. Se reconoce tanto `track_name` como `instrument_name`; el selector muestra el número de golpes para distinguir una batería principal de pistas complementarias como `+ Drums`. Activa **Combinar todas las pistas de batería** o `--merge-drums` para conservar esos golpes adicionales. Los cierres de nota se emparejan dentro de cada pista antes de combinarla. Una pista mixta con notas en canal 10 se filtra por ese canal para evitar convertir instrumentos melódicos. Una pista de batería identificada por su nombre y sin canal 10 usa sus notas de todos los canales. El reporte explica la selección y las notas excluidas.
 
 ## Mapa y decisiones conservadoras
 
@@ -68,11 +71,21 @@ El reporte enumera notas únicas GM antes de convertir, colapsos, descartes de `
 
 1. Carga Kontakt 8 con el preset básico **Invasion**.
 2. En FL Studio usa **File > Import > MIDI file** y selecciona la salida.
-3. Marca **Import time signatures** e importa también los eventos de tempo.
+3. Marca **Import time signatures**. Comprueba por separado el tempo inicial y sus cambios; conservar `set_tempo` en el MIDI no garantiza que FL los importe.
 4. Asigna la batería al instrumento Kontakt; el canal de salida es 1 salvo que hayas elegido 10.
 5. Compara los Edit events de tempo y los compases con las tablas del reporte.
 
-Si FL ignora el conductor al importar, prueba `--copy-timing` o `--format-zero`. La validación automática comprueba el contenido MIDI; la reproducción dentro de Kontakt y la importación en FL Studio requieren esos programas y no se ejecutan en el entorno en la nube.
+`--copy-timing` y `--format-zero` cambian la ubicación de los metadatos MIDI; no garantizan solucionar una importación que ignore tempos. **APROBADO** verifica el contenido MIDI, y no indica que FL haya aplicado el mapa ni que el preset actual de Kontakt tenga estas asignaciones. Si un golpe suena mal, compara su número MIDI en el reporte con **MIDI Mapping** del Invasion que tienes cargado; cambiar las etiquetas de octava no corrige una asignación distinta.
+
+### Automatización de tempo para probar en FL
+
+Con `--fl-tempo-score` se genera además un score de automatización y una tabla CSV del tempo. Esta alternativa usa eventos nativos `REC_Tempo`, y se comprueba su estructura y contenido al escribirla; **su importación en FL Studio aún no está validada**.
+
+Para probarla en una copia de tu proyecto, selecciona el patrón importado, abre **Edit events** desde el control de tempo y busca **File > Open score** en el editor de eventos para cargar el `.fsc`. Pon el patrón al principio de la canción y comprueba los cambios con la tabla CSV y el reporte. Si el editor no acepta el score o no muestra los cambios, no des por importado el mapa de tempos.
+
+El score usa PPQ 96 y solo se genera si cada posición de tempo puede representarse exactamente en esa rejilla; no se redondean ni cuantizan ticks. Sus valores nativos tienen precisión de 0,001 BPM, por lo que los tempos fraccionarios se aproximan con una advertencia y quedan comparados en el CSV. El MIDI conserva siempre los microsegundos originales y su PPQ; la precisión del score es una limitación separada de esta vía experimental.
+
+Referencias del formato: [FL Studio API Stubs: REC_Tempo](https://github.com/IL-Group/FL-Studio-API-Stubs) y [DawVert: lector de eventos FLP/FSC](https://github.com/SatyrDiamond/DawVert). La reproducción en Kontakt y la importación efectiva en FL Studio requieren esos programas y no se ejecutan en el entorno en la nube.
 
 ## Pruebas
 

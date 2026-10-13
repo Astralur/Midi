@@ -24,6 +24,7 @@ class Options:
     include_unmapped: bool = False
     fixed_duration: int | None = None
     octave_offset: int = 2
+    merge_drums: bool = False
 
 
 @dataclass
@@ -58,6 +59,7 @@ class _Note:
     channel: int
     order: int
     off_velocity: int = 0
+    source_track: int = 0
 
 
 @dataclass
@@ -86,8 +88,18 @@ def _channel_nine(track) -> bool:
 
 
 def _track_name(track, index: int) -> str:
-    return next((message.name for message in track
-                 if message.type == "track_name" and message.name), f"Pista {index}")
+    for kind in ("track_name", "instrument_name"):
+        name = next((message.name for message in track
+                     if message.type == kind and message.name), None)
+        if name:
+            return name
+    return f"Pista {index}"
+
+
+def _drum_name(name: str) -> bool:
+    normalized = "".join(c for c in unicodedata.normalize("NFKD", name.lower())
+                         if not unicodedata.combining(c))
+    return any(part in normalized for part in ("drum", "bateria", "percussion"))
 
 
 def inspect_midi(path) -> Inspection:
@@ -103,16 +115,20 @@ def inspect_midi(path) -> Inspection:
     candidates = []
     for index, track in enumerate(midi.tracks):
         name = _track_name(track, index)
-        normalized = "".join(c for c in unicodedata.normalize("NFKD", name.lower())
-                             if not unicodedata.combining(c))
-        named = any(part in normalized for part in ("drum", "bateria", "percussion"))
+        named_track = any(message.type == "track_name" and _drum_name(message.name)
+                          for message in track)
+        named_instrument = any(message.type == "instrument_name" and _drum_name(message.name)
+                               for message in track)
+        named = named_track or named_instrument
         channel_nine = _channel_nine(track)
         if channel_nine or named:
             notes = Counter(message.note for message in track
                             if message.type == "note_on" and message.velocity > 0
                             and (not channel_nine or message.channel == 9))
             reason = " / ".join(part for condition, part in (
-                (channel_nine, "canal MIDI 10"), (named, "nombre de batería")) if condition)
+                (channel_nine, "canal MIDI 10"),
+                (named_track, "nombre de batería"),
+                (named_instrument, "nombre de instrumento de batería")) if condition)
             candidates.append(Candidate(index, name, reason, dict(sorted(notes.items()))))
     warnings = []
     if not any(message.type == "set_tempo" for track in midi.tracks for message in track):
@@ -383,7 +399,13 @@ def convert(input_path, output_path=None, *, track_index=None, mapping_path=None
     inspection = inspect_midi(input_path)
     midi = inspection.midi
     warnings = list(inspection.warnings)
-    if track_index is None:
+    if options.merge_drums and track_index is not None:
+        raise ValueError("Fusionar todas las baterías (--merge-drums) no se puede combinar con una pista explícita (--track).")
+    if options.merge_drums:
+        selected_indices = [candidate.index for candidate in inspection.candidates if candidate.notes]
+        if not selected_indices:
+            raise ValueError("No se detectó ninguna pista de batería con notas para fusionar; se buscan canal MIDI 10 y nombres de pista/instrumento de batería.")
+    elif track_index is None:
         if len(inspection.candidates) != 1:
             choices = "; ".join(f"{candidate.index}: {candidate.name} ({candidate.reason})"
                                 for candidate in inspection.candidates)
@@ -391,8 +413,10 @@ def convert(input_path, output_path=None, *, track_index=None, mapping_path=None
                 raise ValueError("Hay varias pistas candidatas; elige una con --track ÍNDICE: " + choices)
             raise ValueError("No se detectó batería por canal MIDI 10 o nombre. Selecciona explícitamente una pista con --track ÍNDICE.")
         track_index = inspection.candidates[0].index
-    if isinstance(track_index, bool) or not isinstance(track_index, int) or not 0 <= track_index < len(midi.tracks):
-        raise ValueError(f"Índice de pista inválido: {track_index}; el archivo tiene {len(midi.tracks)} pistas.")
+    if not options.merge_drums:
+        if isinstance(track_index, bool) or not isinstance(track_index, int) or not 0 <= track_index < len(midi.tracks):
+            raise ValueError(f"Índice de pista inválido: {track_index}; el archivo tiene {len(midi.tracks)} pistas.")
+        selected_indices = [track_index]
     mapping_path = Path(mapping_path) if mapping_path else Path(__file__).with_name("mapping_invasion.json")
     ensure_mapping(mapping_path)
     mapping = load_mapping(mapping_path, allow_adk=options.allow_adk)
@@ -406,14 +430,34 @@ def convert(input_path, output_path=None, *, track_index=None, mapping_path=None
            or (path.exists() and path.samefile(mapping_path))
            for path in (output_path, report_path)):
         raise ValueError("La salida y el reporte no pueden sobrescribir el mapping JSON editable.")
-    track = midi.tracks[track_index]
-    only_nine = _channel_nine(track)
-    notes, consumed_note_events, selected_end = _read_source_notes(track, only_nine, warnings)
-    if only_nine:
-        other_channels = sorted({message.channel + 1 for message in track
-                                 if hasattr(message, "channel") and message.channel != 9})
-        if other_channels:
-            warnings.append(f"La pista elegida contiene canal 10: solo se procesa su batería; eventos de los canales {other_channels} se descartan y se cuentan por tipo.")
+    notes = []
+    notes_by_track = {}
+    consumed_note_events = {}
+    selection_filters = {}
+    selected_end = 0
+    for index in selected_indices:
+        track = midi.tracks[index]
+        only_nine = _channel_nine(track)
+        selection_filters[index] = only_nine
+        track_warnings = []
+        track_notes, consumed, track_end = _read_source_notes(track, only_nine, track_warnings)
+        warnings.extend(f"Pista {index} ({_track_name(track, index)}): {warning}"
+                        for warning in track_warnings)
+        for note in track_notes:
+            note.source_track = index
+        notes.extend(track_notes)
+        notes_by_track[index] = track_notes
+        consumed_note_events[index] = consumed
+        selected_end = max(selected_end, track_end)
+        if only_nine:
+            other_channels = sorted({message.channel + 1 for message in track
+                                     if hasattr(message, "channel") and message.channel != 9})
+            if other_channels:
+                warnings.append(f"La pista {index} contiene canal 10: solo se procesa su batería; eventos de los canales {other_channels} se descartan y se cuentan por tipo.")
+    # Cada pista se empareja antes de mezclar; así un off nunca cierra otra pista.
+    notes.sort(key=lambda note: (note.tick, note.source_track, note.order))
+    if options.merge_drums:
+        warnings.append(f"Se fusionan {len(selected_indices)} pistas de batería con notas: {', '.join(str(index) for index in selected_indices)}. Emparejamiento note_on/off FIFO independiente por pista, canal y nota; orden para eventos simultáneos: índice de pista y orden original. Se colapsan coincidencias destino/tick también entre pistas.")
     inventory = Counter(note.note for note in notes)
     all_events = []
     song_end = 0
@@ -515,15 +559,24 @@ def convert(input_path, output_path=None, *, track_index=None, mapping_path=None
     passed, failures = _validate(output_path, midi, tempos, signatures, hits, unmapped_hits,
                                  options, len(mapped), collapsed_count, key_events, warnings)
     targets = {int(item["midi"]): item for item in TARGETS}
+    selected_text = "; ".join(f"{index} — {_track_name(midi.tracks[index], index)}"
+                              for index in selected_indices)
+    selection_text = ("fusionar todas las candidatas de batería con notas"
+                      if options.merge_drums else "una pista de batería")
     lines = ["SONGSTERR → GGD INVASION — REPORTE", "=" * 72,
              f"Entrada: {input_path}", f"Salida: {output_path}",
              f"Mapa editable: {mapping_path.resolve()}",
-             f"Pista elegida (índice desde 0): {track_index} — {_track_name(track, track_index)}",
-             f"Selección: {'solo canal MIDI 10' if only_nine else 'todos los canales de la pista seleccionada'}",
+             f"{'Pistas elegidas (índices desde 0)' if options.merge_drums else 'Pista elegida (índice desde 0)'}: {selected_text}",
+             f"Selección: {selection_text}",
              f"Formato entrada/salida: {midi.type}/{output.type}; PPQ original/salida: {midi.ticks_per_beat}/{output.ticks_per_beat}",
              f"Canal de batería: {options.output_channel + 1}; alternancia: {'sí' if options.alternate_kicks else 'no'}; ADK: {'permitido por JSON' if options.allow_adk else 'prohibido'}",
              f"Nombres: Kontakt C3 = MIDI 60; FL C{3 + options.octave_offset} = MIDI 60; OCTAVE_OFFSET={options.octave_offset}. Los números MIDI mandan.",
-             "", "INVENTARIO GM ANTES DE CONVERTIR", "MIDI | Nombre GM | Cantidad"]
+             "", "PISTAS PROCESADAS ANTES DE CONVERTIR", "Índice | Nombre | Filtro | Notas origen | Mapeadas | No mapeadas"]
+    for index in selected_indices:
+        track_notes = notes_by_track[index]
+        mapped_count = sum(note.note in mapping for note in track_notes)
+        lines.append(f"{index} | {_track_name(midi.tracks[index], index)} | {'solo canal MIDI 10' if selection_filters[index] else 'todos los canales de esta pista'} | {len(track_notes)} | {mapped_count} | {len(track_notes) - mapped_count}")
+    lines += ["", "INVENTARIO GM ANTES DE CONVERTIR", "MIDI | Nombre GM | Cantidad"]
     lines += [f"{number} | {GM_NAMES.get(number, 'Fuera del mapa GM estándar')} | {inventory[number]}"
               for number in sorted(inventory)] or ["(sin notas)"]
     lines += ["", "MAPEO APLICADO", "Origen GM | Cantidad | Pieza Invasion | MIDI | Kontakt | FL"]
@@ -557,9 +610,9 @@ def convert(input_path, output_path=None, *, track_index=None, mapping_path=None
         lines.append(f"{index} | {tick} | {_position(tick, midi.ticks_per_beat, signatures)} | {message.numerator}/{message.denominator} | {message.clocks_per_click} | {message.notated_32nd_notes_per_beat}")
     if not signatures:
         lines.append("Sin eventos de compás; 4/4 implícito usado solo para posiciones del reporte.")
-    lines += ["", "COLAPSOS DECLARADOS", "Tick | MIDI destino | Kontakt | FL | Orígenes (MIDI, velocidad, duración ticks) | Velocidad final | Duración final"]
+    lines += ["", "COLAPSOS DECLARADOS", "Tick | MIDI destino | Kontakt | FL | Orígenes (pista, MIDI, velocidad, duración ticks) | Velocidad final | Duración final"]
     for hit in collisions:
-        source_text = "; ".join(f"({note.note}, {note.velocity}, {note.end - note.tick})" for note in hit.sources)
+        source_text = "; ".join(f"(pista {note.source_track}, {note.note}, {note.velocity}, {note.end - note.tick})" for note in hit.sources)
         lines.append(f"{hit.tick} | {hit.note} | {note_name(hit.note, c4_octave=3)} | {note_name(hit.note, c4_octave=3 + options.octave_offset)} | {source_text} | {hit.velocity} | {hit.end - hit.tick}")
     if not collisions:
         lines.append("Ninguno.")
@@ -577,7 +630,7 @@ def convert(input_path, output_path=None, *, track_index=None, mapping_path=None
                 continue
             if first_song_name and (index, order) == first_song_name[:2]:
                 continue
-            if index == track_index and order in consumed_note_events:
+            if order in consumed_note_events.get(index, set()):
                 number = message.note
                 if number in mapping:
                     transformed[message.type] += 1

@@ -112,6 +112,30 @@ class ConversionTests(unittest.TestCase):
         self.assertTrue(Path(result.report_path).is_file())
         return result, mido.MidiFile(result.output_path)
 
+    def write_split_drums(self, main_hits, supplementary_hits, *, main_name=None, supplementary_channel=1):
+        """Songsterr puede separar golpes auxiliares en una pista '+ Drums'."""
+        midi = mido.MidiFile(type=1, ticks_per_beat=480)
+        midi.tracks.append(track_from_events([
+            (0, mido.MetaMessage("track_name", name="Canción dividida")),
+            (0, mido.MetaMessage("set_tempo", tempo=500003)),
+            (480, mido.MetaMessage("set_tempo", tempo=433337)),
+            (0, mido.MetaMessage("time_signature", numerator=4, denominator=4)),
+        ]))
+        main_events = [(0, mido.MetaMessage("instrument_name", name="Drums"))]
+        if main_name is not None:
+            main_events.append((0, mido.MetaMessage("track_name", name=main_name)))
+        midi.tracks.append(track_from_events(main_events + hits_events(main_hits, channel=0)))
+        midi.tracks.append(track_from_events([
+            (0, mido.MetaMessage("track_name", name="+ Drums")),
+        ] + hits_events(supplementary_hits, channel=supplementary_channel)))
+        # Esta nota coincidiría con un número GM si se confundiera con batería.
+        midi.tracks.append(track_from_events([
+            (0, mido.MetaMessage("instrument_name", name="Guitar")),
+        ] + hits_events([(10, 38, 127, 40)], channel=2)))
+        path = self.root / "bateria_dividida.mid"
+        midi.save(path)
+        return path
+
     def test_complete_kontakt_table_uses_midi_numbers_and_fl_octaves(self):
         actual = {item["midi"]: item["kontakt"] for item in TARGETS}
         self.assertEqual(KONTAKT_EXPECTED, actual)
@@ -315,6 +339,60 @@ class ConversionTests(unittest.TestCase):
         self.assertEqual([(0, 500000), (240, 454547)],
                          [(tick, msg.tempo) for tick, msg in absolute_events(output.tracks[0])
                           if msg.type == "set_tempo"])
+
+    def test_instrument_name_detects_drums_without_matching_track_name(self):
+        for name in (None, "Parte principal"):
+            with self.subTest(track_name=name):
+                path = self.write_split_drums([(0, 38, 90, 30)], [(80, 42, 80, 20)], main_name=name)
+                inspection = inspect_midi(path)
+                self.assertEqual([1, 2], [candidate.index for candidate in inspection.candidates])
+                self.assertEqual({38: 1}, inspection.candidates[0].notes)
+                self.assertEqual({42: 1}, inspection.candidates[1].notes)
+                self.assertIn("instrument", inspection.candidates[0].reason.lower())
+
+    def test_merge_drums_keeps_four_supplementary_notes_and_excludes_guitar(self):
+        path = self.write_split_drums([(0, 35, 90, 30), (120, 36, 100, 30), (240, 38, 110, 45)],
+                                     [(24, 38, 85, 25), (160, 42, 86, 20),
+                                      (320, 49, 87, 50), (480, 51, 88, 60)])
+        source = mido.MidiFile(path)
+        result, output = self.run_conversion(path, options=Options(merge_drums=True))
+        self.assertEqual([(0, 23, 90, 0), (24, 26, 85, 0), (120, 24, 100, 0),
+                          (160, 43, 86, 0), (240, 26, 110, 0), (320, 52, 87, 0),
+                          (480, 62, 88, 0)], positive_notes(output.tracks[1]))
+        self.assertEqual([(30, 23, 0), (49, 26, 0), (150, 24, 0), (180, 43, 0),
+                          (285, 26, 0), (370, 52, 0), (540, 62, 0)], note_ends(output.tracks[1]))
+        self.assertIn("notas origen mapeadas=7", result.report.lower())
+        self.assertIn("+ Drums", result.report)
+        for kind in ("set_tempo", "time_signature"):
+            self.assertEqual(timing(source.tracks[0], kind), timing(output.tracks[0], kind))
+
+    def test_merge_pairs_source_notes_independently_between_tracks(self):
+        # Misma nota MIDI en dos canales y dos pistas: el apagado de la pista
+        # auxiliar no debe cerrar anticipadamente la nota principal.
+        for supplementary_channel in (0, 1):
+            with self.subTest(supplementary_channel=supplementary_channel):
+                path = self.write_split_drums([(0, 38, 90, 200)], [(50, 38, 110, 20)],
+                                             supplementary_channel=supplementary_channel)
+                result, output = self.run_conversion(path, options=Options(merge_drums=True))
+                self.assertEqual([(0, 26, 90, 0), (50, 26, 110, 0)], positive_notes(output.tracks[1]))
+                self.assertEqual([(70, 26, 0), (200, 26, 0)], note_ends(output.tracks[1]))
+                self.assertIn("solap", result.report.lower())
+
+    def test_merge_same_tick_collision_collapses_across_tracks(self):
+        path = self.write_split_drums([(10, 38, 80, 100)], [(10, 40, 120, 35)])
+        result, output = self.run_conversion(path, options=Options(merge_drums=True))
+        self.assertEqual([(10, 26, 120, 0)], positive_notes(output.tracks[1]))
+        self.assertEqual([(110, 26, 0)], note_ends(output.tracks[1]))
+        self.assertIn("colaps", result.report.lower())
+        self.assertIn("notas origen mapeadas=2", result.report.lower())
+
+    def test_merge_and_explicit_track_are_mutually_exclusive(self):
+        path = self.write_split_drums([(0, 38, 90, 30)], [(80, 42, 80, 20)])
+        original = path.read_bytes()
+        with self.assertRaises(ValueError):
+            convert(path, track_index=1, options=Options(merge_drums=True))
+        self.assertEqual(original, path.read_bytes())
+        self.assertFalse(path.with_name(path.stem + "_Invasion.mid").exists())
 
     def test_type_zero_input_and_running_status(self):
         # El segundo note_on y los apagados usan running status sin byte 0x99.

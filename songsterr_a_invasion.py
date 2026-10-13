@@ -32,12 +32,14 @@ def parser():
     result.add_argument("archivo", nargs="?", type=Path)
     result.add_argument("--gui", action="store_true", help="abrir la interfaz gráfica")
     result.add_argument("--track", type=int, help="índice de la pista de batería")
+    result.add_argument("--merge-drums", action="store_true", help="combinar todas las pistas de batería detectadas")
     result.add_argument("--output", type=Path, help="ruta del MIDI de salida")
     result.add_argument("--mapping", type=Path, default=DEFAULT_MAPPING_PATH, help="JSON de remapeo editable")
     result.add_argument("--no-alternate-kicks", action="store_true", help="desactivar alternancia L/R")
     result.add_argument("--channel", type=int, choices=(1, 10), default=1, help="canal MIDI de salida")
     result.add_argument("--format-zero", action="store_true", help="MIDI formato 0 con una sola pista")
     result.add_argument("--copy-timing", action="store_true", help="copiar tempo y compás a la batería")
+    result.add_argument("--fl-tempo-score", action="store_true", help="exportar automatización de tempo .fsc (experimental, comprobar en FL)")
     result.add_argument("--include-unmapped", action="store_true", help="incluir pista NO_MAPEADAS")
     result.add_argument("--fixed-duration", type=int, metavar="TICKS", help="duración fija en ticks (opcional)")
     result.add_argument("--adk", action="store_true", help="permitir destino ADK 22 en el mapa editable")
@@ -53,7 +55,8 @@ def cli(args):
     if args.list_tracks:
         candidate_indexes = {c.index for c in inspection.candidates}
         for index, track in enumerate(inspection.midi.tracks):
-            name = next((m.name for m in track if m.type == "track_name"), f"Pista {index}")
+            name = next((m.name for kind in ("track_name", "instrument_name")
+                         for m in track if m.type == kind and m.name), f"Pista {index}")
             marker = " [candidata a batería]" if index in candidate_indexes else ""
             print(f"Pista {index}: {name}{marker}")
     for candidate in inspection.candidates:
@@ -64,7 +67,9 @@ def cli(args):
     if not inspection.candidates:
         raise ValueError("No se detectó una pista de batería con notas en canal 10 o nombre de batería.")
     track = args.track
-    if track is None and len(inspection.candidates) > 1:
+    if args.merge_drums and track is not None:
+        raise ValueError("Usa --merge-drums o --track, no ambas opciones a la vez.")
+    if track is None and len(inspection.candidates) > 1 and not args.merge_drums:
         if not sys.stdin.isatty():
             raise ValueError("Hay varias pistas candidatas; elige una con --track INDICE.")
         try:
@@ -87,10 +92,17 @@ def cli(args):
             include_unmapped=args.include_unmapped,
             fixed_duration=args.fixed_duration,
             octave_offset=args.octave_offset,
+            merge_drums=args.merge_drums,
         ),
     )
     print(result.report)
     print(f"MIDI: {result.output_path}\nReporte: {result.report_path}\nMapa: {args.mapping}")
+    if args.fl_tempo_score and result.passed:
+        from fl_tempo_score import export_tempo_score
+        score = export_tempo_score(result.output_path)
+        print(f"Tempo FL (experimental): {score.path}\nTabla exacta de tempos: {score.csv_path}")
+        for warning in score.warnings:
+            print(f"AVISO: {warning}")
     return 0 if result.passed else 2
 
 
@@ -110,8 +122,10 @@ def run_gui(args):
     channel_ten = tk.BooleanVar(value=args.channel == 10)
     format_zero = tk.BooleanVar(value=args.format_zero)
     copy_timing = tk.BooleanVar(value=args.copy_timing)
+    fl_tempo_score = tk.BooleanVar(value=args.fl_tempo_score)
     include_unmapped = tk.BooleanVar(value=args.include_unmapped)
     adk = tk.BooleanVar(value=args.adk)
+    merge_drums = tk.BooleanVar(value=args.merge_drums)
     fixed_enabled = tk.BooleanVar(value=args.fixed_duration is not None)
     duration = tk.StringVar(value=str(args.fixed_duration or 120))
     octave_offset = tk.StringVar(value=str(args.octave_offset))
@@ -149,14 +163,16 @@ def run_gui(args):
         ("Alternar bombos L/R", alternate), ("Salida en canal 10 (por defecto 1)", channel_ten),
         ("Formato 0 (una pista)", format_zero), ("Copiar tempo y compás en batería", copy_timing),
         ("Incluir NO_MAPEADAS", include_unmapped), ("Permitir ADK 22 en el mapa", adk),
+        ("Combinar todas las pistas de batería", merge_drums),
+        ("Tempo FL .fsc (experimental)", fl_tempo_score),
     ]):
         ttk.Checkbutton(options_frame, text=label, variable=variable).grid(
             row=position // 2, column=position % 2, sticky="w", padx=5, pady=2
         )
-    ttk.Checkbutton(options_frame, text="Duración fija (ticks):", variable=fixed_enabled).grid(row=3, column=0, sticky="w", padx=5)
-    ttk.Entry(options_frame, textvariable=duration, width=9).grid(row=3, column=1, sticky="w", padx=5)
-    ttk.Label(options_frame, text="Octavas FL sobre Kontakt C3=60:").grid(row=4, column=0, sticky="w", padx=5, pady=5)
-    ttk.Spinbox(options_frame, from_=-8, to=8, textvariable=octave_offset, width=8).grid(row=4, column=1, sticky="w", padx=5)
+    ttk.Checkbutton(options_frame, text="Duración fija (ticks):", variable=fixed_enabled).grid(row=4, column=0, sticky="w", padx=5)
+    ttk.Entry(options_frame, textvariable=duration, width=9).grid(row=4, column=1, sticky="w", padx=5)
+    ttk.Label(options_frame, text="Octavas FL sobre Kontakt C3=60:").grid(row=5, column=0, sticky="w", padx=5, pady=5)
+    ttk.Spinbox(options_frame, from_=-8, to=8, textvariable=octave_offset, width=8).grid(row=5, column=1, sticky="w", padx=5)
 
     actions = ttk.Frame(outer)
     actions.pack(fill="x", pady=8)
@@ -209,7 +225,7 @@ def run_gui(args):
             inspection = inspect_midi(Path(selected_file.get()))
             scanned_file[0] = Path(selected_file.get()).resolve()
             candidates = inspection.candidates
-            tracks.configure(values=[f"{c.index}: {c.name} ({c.reason})" for c in candidates])
+            tracks.configure(values=[f"{c.index}: {c.name} — {sum(c.notes.values())} golpes ({c.reason})" for c in candidates])
             for warning in inspection.warnings:
                 append_log(f"AVISO: {warning}")
             for candidate in candidates:
@@ -223,7 +239,10 @@ def run_gui(args):
                         break
             if not candidates:
                 raise ValueError("No se detectó ninguna pista de batería con notas.")
-            status.set("Elige una pista." if len(candidates) > 1 else "Pista detectada. Lista para convertir.")
+            if merge_drums.get():
+                status.set(f"Se combinarán {len(candidates)} pistas de batería.")
+            else:
+                status.set("Elige una pista." if len(candidates) > 1 else "Pista detectada. Lista para convertir.")
             return True
         except Exception as error:
             append_log(f"ERROR: {error}")
@@ -261,7 +280,7 @@ def run_gui(args):
                 if candidate.index == chosen_index:
                     tracks.current(i)
                     break
-        if tracks.current() < 0:
+        if tracks.current() < 0 and not merge_drums.get():
             messagebox.showerror("Elige una pista", "Hay varias candidatas. Elige la pista de batería.", parent=root)
             return
         try:
@@ -274,22 +293,35 @@ def run_gui(args):
                 format_zero=format_zero.get(), copy_timing=copy_timing.get(),
                 include_unmapped=include_unmapped.get(), fixed_duration=ticks,
                 octave_offset=int(octave_offset.get()),
+                merge_drums=merge_drums.get(),
             )
             source = Path(selected_file.get())
             mapping = Path(selected_mapping.get())
             ensure_mapping(mapping)
             load_mapping(mapping, allow_adk=opts.allow_adk)
-            index = candidates[tracks.current()].index
+            index = None if opts.merge_drums else candidates[tracks.current()].index
+            write_fl_score = fl_tempo_score.get()
         except Exception as error:
             messagebox.showerror("Opciones inválidas", str(error), parent=root)
             return
-        append_log(inventory_text(candidates[tracks.current()]))
+        for candidate in candidates if opts.merge_drums else [candidates[tracks.current()]]:
+            append_log(inventory_text(candidate))
         set_busy(True)
         status.set("Convirtiendo y validando el archivo escrito…")
 
         def worker():
             try:
-                messages.put(("result", convert(source, args.output, track_index=index, mapping_path=mapping, options=opts)))
+                result = convert(source, args.output, track_index=index, mapping_path=mapping, options=opts)
+                extra = ""
+                if write_fl_score and result.passed:
+                    try:
+                        from fl_tempo_score import export_tempo_score
+                        score = export_tempo_score(result.output_path)
+                        extra = f"Tempo FL (experimental): {score.path}\nTabla exacta de tempos: {score.csv_path}\n"
+                        extra += "\n".join(f"AVISO: {warning}" for warning in score.warnings)
+                    except Exception as error:
+                        extra = f"El MIDI se generó. No se pudo exportar el tempo FL: {error}"
+                messages.put(("result", (result, extra)))
             except Exception as error:
                 messages.put(("error", str(error)))
 
@@ -305,11 +337,14 @@ def run_gui(args):
                     status.set("Conversión fallida.")
                     messagebox.showerror("Conversión fallida", item, parent=root)
                 else:
+                    item, extra = item
                     append_log(item.report)
                     append_log(f"MIDI: {item.output_path}\nReporte: {item.report_path}")
+                    if extra:
+                        append_log(extra)
                     last_output[0] = item.output_path
                     open_button.configure(state="normal")
-                    status.set("APROBADO" if item.passed else "FALLO: archivo no fiable")
+                    status.set("APROBADO MIDI; comprobar importación en FL" if item.passed else "FALLO: archivo no fiable")
                     if not item.passed:
                         messagebox.showwarning("Validación fallida", "El archivo no es fiable. Consulta el reporte.", parent=root)
         except queue.Empty:

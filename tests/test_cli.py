@@ -98,6 +98,25 @@ class CliTests(unittest.TestCase):
         self.assertEqual(1, invalid.returncode)
         self.assertIn("--track", invalid.stderr)
 
+    def test_merge_drums_flag_preserves_all_four_supplementary_hits(self):
+        midi = mido.MidiFile(self.source)
+        midi.tracks.append(track_from_events([
+            (0, mido.MetaMessage("track_name", name="+ Drums")),
+        ] + hits_events([(24, 38, 85, 25), (160, 42, 86, 20),
+                         (320, 49, 87, 50), (480, 51, 88, 60)], channel=3)))
+        midi.save(self.source)
+        result = self.command(self.source, "--merge-drums")
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn("APROBADO", result.stdout)
+        self.assertIn("+ Drums", result.stdout)
+        output = mido.MidiFile(self.expected_output())
+        self.assertEqual([(0, 23, 90, 0), (24, 26, 85, 0), (120, 24, 100, 0),
+                          (160, 43, 86, 0), (240, 26, 110, 0), (320, 52, 87, 0),
+                          (480, 62, 88, 0)], positive_notes(output.tracks[1]))
+        invalid = self.command(self.source, "--merge-drums", "--track", 1)
+        self.assertEqual(1, invalid.returncode)
+        self.assertTrue(invalid.stderr)
+
     def test_format_zero_channel_duration_unmapped_and_custom_output(self):
         destination = self.root / "salida elegida.mid"
         result = self.command(self.source, "--format-zero", "--include-unmapped",
@@ -122,10 +141,29 @@ class CliTests(unittest.TestCase):
         for kind in ("set_tempo", "time_signature"):
             self.assertEqual(timing(output.tracks[0], kind), timing(output.tracks[1], kind))
 
+    def test_experimental_fl_tempo_score_option_writes_binary_score_and_csv(self):
+        from tests.test_fl_tempo_score import decode_tempo_score
+
+        result = self.command(self.source, "--fl-tempo-score")
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn("experimental", result.stdout.lower())
+        self.assertIn("APROBADO", result.stdout)
+        scores = list(self.root.glob("*.fsc"))
+        tables = list(self.root.glob("*.csv"))
+        self.assertEqual(1, len(scores))
+        self.assertEqual(1, len(tables))
+        header, records = decode_tempo_score(scores[0])
+        self.assertEqual((0x10, 1, 96), header)
+        self.assertEqual([(0, 0x40000005, 119999), (192, 0x40000005, 142505)], records)
+        midi = mido.MidiFile(self.expected_output())
+        self.assertEqual([(0, 23, 90, 0), (120, 24, 100, 0), (240, 26, 110, 0)],
+                         positive_notes(midi.tracks[1]))
+
     def test_help_exits_without_opening_gui(self):
         result = self.command("--help")
         self.assertEqual(0, result.returncode, result.stderr)
-        for option in ("--track", "--format-zero", "--copy-timing", "--adk", "--octave-offset"):
+        for option in ("--track", "--merge-drums", "--format-zero", "--copy-timing", "--adk",
+                       "--octave-offset", "--fl-tempo-score"):
             self.assertIn(option, result.stdout)
         self.assertFalse(self.expected_output().exists())
 
